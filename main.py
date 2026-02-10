@@ -1,51 +1,45 @@
-from fastapi import FastAPI, UploadFile, File
-import face_recognition
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Dict, List
 import numpy as np
-import cv2
 
-app = FastAPI()
+app = FastAPI(title="AI Attendance Backend")
 
-# Lưu face encoding tạm (test)
-KNOWN_FACE = None
-KNOWN_NAME = None
+# In-memory DB (test). Production sẽ dùng Postgres.
+EMP_DB: Dict[str, List[float]] = {}
 
-@app.get("/")
-def root():
-    return {"status": "AI Attendance Backend Running"}
+class EnrollReq(BaseModel):
+    employee_id: str
+    embedding: List[float]
 
-@app.post("/register")
-async def register_face(name: str, file: UploadFile = File(...)):
-    global KNOWN_FACE, KNOWN_NAME
+class AttendanceReq(BaseModel):
+    timestamp: str
+    location: str
+    employee_id: str
+    score: float
+    camera_ip: str
 
-    image_bytes = await file.read()
-    npimg = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+@app.get("/health")
+def health():
+    return {"ok": True, "employees": len(EMP_DB)}
 
-    encodings = face_recognition.face_encodings(img)
-    if not encodings:
-        return {"error": "No face detected"}
+@app.post("/enroll")
+def enroll(req: EnrollReq):
+    emb = np.array(req.embedding, dtype=np.float32)
+    if emb.ndim != 1 or emb.shape[0] < 128:
+        raise HTTPException(400, "Embedding không hợp lệ (kỳ vọng vector 512).")
+    norm = np.linalg.norm(emb)
+    if norm == 0:
+        raise HTTPException(400, "Embedding norm=0.")
+    emb = (emb / norm).tolist()
+    EMP_DB[req.employee_id] = emb
+    return {"ok": True, "employee_id": req.employee_id}
 
-    KNOWN_FACE = encodings[0]
-    KNOWN_NAME = name
+@app.get("/db")
+def get_db():
+    return {"db": EMP_DB}
 
-    return {"message": f"Registered {name}"}
-
-@app.post("/check")
-async def check_face(file: UploadFile = File(...)):
-    if KNOWN_FACE is None:
-        return {"error": "No registered face"}
-
-    image_bytes = await file.read()
-    npimg = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
-
-    encodings = face_recognition.face_encodings(img)
-    if not encodings:
-        return {"result": "No face"}
-
-    match = face_recognition.compare_faces([KNOWN_FACE], encodings[0])[0]
-
-    return {
-        "match": match,
-        "name": KNOWN_NAME if match else "Unknown"
-    }
+@app.post("/attendance")
+def attendance(req: AttendanceReq):
+    # Test: nhận log, bước sau sẽ ghi Google Sheet
+    return {"ok": True, "received": req.model_dump()}
