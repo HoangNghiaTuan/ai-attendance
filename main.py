@@ -1,134 +1,125 @@
 import os
-from pathlib import Path
+import glob
+import time
 from typing import Dict, List, Optional
 
-import cv2
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from pydantic import BaseModel
-from insightface.app import FaceAnalysis
+import face_recognition
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
-FACES_DIR = Path("faces")
-SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", "0.38"))
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+FACES_DIR = os.path.join(APP_DIR, "faces")
 
-app = FastAPI(title="ai-attendance-local")
-
-face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-face_app.prepare(ctx_id=0, det_size=(640, 640))
-
+# DB: emp_id -> list of encodings
 DB: Dict[str, List[np.ndarray]] = {}
 
-class RecognizeResult(BaseModel):
-    ok: bool
-    employee_id: Optional[str] = None
-    similarity: Optional[float] = None
-    message: str
+app = FastAPI(title="AI Attendance Demo (Upload Image)")
 
-def _get_embedding(bgr: np.ndarray) -> np.ndarray:
-    faces = face_app.get(bgr)
-    if not faces:
-        raise ValueError("Không phát hiện khuôn mặt trong ảnh.")
-    faces = sorted(
-        faces,
-        key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]),
-        reverse=True
-    )
-    emb = faces[0].embedding.astype(np.float32)
-    emb = emb / (np.linalg.norm(emb) + 1e-9)
-    return emb
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+def root():
+    return {"ok": True, "message": "AI Attendance API is running", "faces_dir": FACES_DIR}
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b))
+    a = a.astype(np.float32)
+    b = b.astype(np.float32)
+    na = np.linalg.norm(a) + 1e-8
+    nb = np.linalg.norm(b) + 1e-8
+    return float(np.dot(a, b) / (na * nb))
 
-def load_faces():
-    DB.clear()
-    if not FACES_DIR.exists():
-        return
-    for emp_dir in FACES_DIR.iterdir():
-        if not emp_dir.is_dir():
-            continue
-        emp_id = emp_dir.name
-        embs: List[np.ndarray] = []
-        for img_path in emp_dir.glob("*.jpg"):
-            bgr = cv2.imread(str(img_path))
-            if bgr is None:
-                continue
+def _load_faces() -> Dict[str, List[np.ndarray]]:
+    if not os.path.exists(FACES_DIR):
+        raise HTTPException(status_code=400, detail=f"Không thấy thư mục faces/ tại {FACES_DIR}")
+
+    db: Dict[str, List[np.ndarray]] = {}
+    # faces/nv001/1.jpg ...
+    emp_dirs = [p for p in glob.glob(os.path.join(FACES_DIR, "*")) if os.path.isdir(p)]
+
+    for emp_path in emp_dirs:
+        emp_id = os.path.basename(emp_path)
+        imgs = []
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
+            imgs.extend(glob.glob(os.path.join(emp_path, ext)))
+
+        encs: List[np.ndarray] = []
+        for img_path in imgs:
             try:
-                embs.append(_get_embedding(bgr))
+                img = face_recognition.load_image_file(img_path)
+                # lấy encoding face đầu tiên trong ảnh
+                faces = face_recognition.face_encodings(img)
+                if len(faces) == 0:
+                    continue
+                encs.append(faces[0])
             except Exception:
-                pass
-        if embs:
-            DB[emp_id] = embs
+                continue
 
-@app.on_event("startup")
-def _startup():
-    load_faces()
+        if encs:
+            db[emp_id] = encs
 
-@app.get("/health")
-def health():
-    return {"ok": True, "employees": len(DB), "samples": sum(len(v) for v in DB.values())}
+    return db
 
 @app.post("/reload")
 def reload_db():
-    load_faces()
-    return {"ok": True, "employees": len(DB), "samples": sum(len(v) for v in DB.values())}
+    global DB
+    DB = _load_faces()
+    return {
+        "ok": True,
+        "employees": len(DB),
+        "samples": {k: len(v) for k, v in DB.items()}
+    }
 
-@app.post("/recognize", response_model=RecognizeResult)
-async def recognize(file: UploadFile = File(...)):
-    if not DB:
-        raise HTTPException(status_code=400, detail="DB rỗng. Upload ảnh vào faces/ rồi gọi /reload")
-    data = await file.read()
-    img = np.frombuffer(data, dtype=np.uint8)
-    bgr = cv2.imdecode(img, cv2.IMREAD_COLOR)
-    if bgr is None:
-        return RecognizeResult(ok=False, message="Không đọc được ảnh.")
-    try:
-        emb = _get_embedding(bgr)
-    except Exception as e:
-        return RecognizeResult(ok=False, message=str(e))
-
-    best_emp, best_sim = None, -1.0
-    for emp_id, samples in DB.items():
-        for s in samples:
-            sim = _cosine(emb, s)
-            if sim > best_sim:
-                best_sim = sim
-                best_emp = emp_id
-
-    if best_emp is None or best_sim < SIM_THRESHOLD:
-        return RecognizeResult(ok=True, employee_id=None, similarity=best_sim, message="unknown")
-    return RecognizeResult(ok=True, employee_id=best_emp, similarity=best_sim, message="matched")
-
-@app.get("/snap-and-recognize", response_model=RecognizeResult)
-def snap_and_recognize(
-    rtsp: str = Query(..., description="RTSP URL"),
+@app.post("/recognize_image")
+async def recognize_image(
+    file: UploadFile = File(...),
+    threshold: float = 0.42,  # cosine similarity threshold (tùy chỉnh)
 ):
     if not DB:
-        raise HTTPException(status_code=400, detail="DB rỗng. Upload ảnh vào faces/ rồi gọi /reload")
+        raise HTTPException(status_code=400, detail="DB rỗng. Hãy gọi POST /reload trước.")
 
-    cap = cv2.VideoCapture(rtsp)
-    if not cap.isOpened():
-        return RecognizeResult(ok=False, message="Không mở được RTSP. Kiểm tra URL/user/pass/mạng.")
-
-    ok, frame = cap.read()
-    cap.release()
-
-    if not ok or frame is None:
-        return RecognizeResult(ok=False, message="Không đọc được frame từ camera.")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="File rỗng.")
 
     try:
-        emb = _get_embedding(frame)
-    except Exception as e:
-        return RecognizeResult(ok=False, message=str(e))
+        # đọc ảnh từ bytes
+        img = face_recognition.load_image_file(np.frombuffer(content, dtype=np.uint8))
+    except Exception:
+        # fallback: load_image_file cần path, nên cách chắc ăn:
+        # -> decode bằng face_recognition không ổn định theo bản, dùng numpy+cv2 thì cần opencv
+        raise HTTPException(status_code=400, detail="Không đọc được ảnh. Hãy upload jpg/png hợp lệ.")
 
-    best_emp, best_sim = None, -1.0
+    # tìm face locations + encodings
+    encs = face_recognition.face_encodings(img)
+    if len(encs) == 0:
+        return {"ok": False, "message": "Không phát hiện khuôn mặt trong ảnh."}
+
+    query = encs[0]
+
+    best_emp: Optional[str] = None
+    best_sim: float = -1.0
+
     for emp_id, samples in DB.items():
         for s in samples:
-            sim = _cosine(emb, s)
+            sim = _cosine(query, s)
             if sim > best_sim:
                 best_sim = sim
                 best_emp = emp_id
 
-    if best_emp is None or best_sim < SIM_THRESHOLD:
-        return RecognizeResult(ok=True, employee_id=None, similarity=best_sim, message="unknown")
-    return RecognizeResult(ok=True, employee_id=best_emp, similarity=best_sim, message="matched")
+    matched = best_emp is not None and best_sim >= threshold
+    return {
+        "ok": True,
+        "matched": matched,
+        "emp_id": best_emp if matched else None,
+        "best_candidate": best_emp,
+        "similarity": round(best_sim, 4),
+        "threshold": threshold,
+        "ts": int(time.time())
+    }
